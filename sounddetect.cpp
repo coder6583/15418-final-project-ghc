@@ -1,0 +1,244 @@
+#include <mpi.h>
+#include <fstream>
+#include <iostream>
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
+#include <vector>
+#include <unistd.h>
+#include <climits>
+#include <cmath>
+
+#define SOUND_OF_SPEED 343
+#define MAX_LAG 30
+
+#define X_MIN -1.0f
+#define X_MAX 1.0f
+#define Y_MIN -1.0f
+#define Y_MAX 1.0f
+#define GRID_WIDTH 200
+#define GRID_HEIGHT 200
+
+#define DX (X_MAX - X_MIN) / (GRID_WIDTH - 1)
+#define DY (Y_MAX - Y_MIN) / (GRID_HEIGHT - 1)
+
+#define ENERGY_THRESHOLD 20000000000
+
+int get_next_rank(int rank, int nproc) {
+  return (rank + 1) % nproc;
+}
+
+int get_prev_rank(int rank, int nproc) {
+  if (rank == 0) {
+    return nproc - 1;
+  } else {
+    return rank - 1;
+  }
+}
+
+void sounddetect_ref_pair(
+  std::vector<int32_t> &mic_data,
+  int num_samples,
+  int sample_freq,
+  const std::vector<std::vector<float>> &mic_positions,
+  int nproc,
+  int rank
+) {
+  std::vector<std::vector<int16_t>> all_mic_data(nproc, std::vector<int16_t>());
+
+  // Simplifying from 24 bits to 16 bits
+  all_mic_data[rank].push_back((int16_t)rank);
+  for (auto &data: mic_data) {
+    all_mic_data[rank].push_back((int16_t)(data >> 8));
+  }
+
+  int send_size = num_samples + 1;
+  for (int i = 0; i < nproc; i++) {
+    if (i != rank) {
+      all_mic_data[i] = std::vector<int16_t>(send_size, 0);
+    }
+  }
+
+  int next_rank = get_next_rank(rank, nproc);
+  int prev_rank = get_prev_rank(rank, nproc);
+  // Send data to all nodes
+  // initiate sending data
+  MPI_Send(all_mic_data[rank].data(), send_size * sizeof(int16_t),
+           MPI_BYTE, next_rank, rank, MPI_COMM_WORLD);
+  int done = 0;
+  while (!done) {
+    std::vector<int16_t> recv_buffer(send_size, 0);
+    MPI_Recv(recv_buffer.data(), send_size * sizeof(int16_t),
+             MPI_BYTE, prev_rank, MPI_ANY_TAG, MPI_COMM_WORLD, NULL);
+
+    int orig_src = recv_buffer[0];
+    if (orig_src == rank) {
+      done = 1;
+    } else {
+      if (rank != 0) {
+        memcpy(all_mic_data[orig_src].data(), recv_buffer.data(),
+               send_size * sizeof(int16_t));
+      }
+      MPI_Send(recv_buffer.data(), send_size * sizeof(int16_t),
+               MPI_BYTE, next_rank, rank, MPI_COMM_WORLD);
+      done = 0;
+    }
+  }
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  // Find Time Lag
+  std::vector<float> best_dist_diff(nproc, 0.0f);
+  bool silent = true;
+
+  for (int i = 1; i < nproc; i++) {
+    int64_t energy = 0;
+    int best_lag = 0;
+    int64_t best_score = INT64_MIN;
+    for (int lag = -MAX_LAG; lag < MAX_LAG; lag++) {
+      int64_t score = 0;
+      for (int j = 1; j < send_size; j++) {
+        energy += (int64_t)all_mic_data[0][j] * (int64_t)all_mic_data[0][j];
+        if (j + lag < 0) {
+          continue;
+        }
+        if (j + lag >= send_size) {
+          continue;
+        }
+        score += (int64_t)all_mic_data[i][j + lag] * (int64_t)all_mic_data[0][j];
+      }
+      if (score > best_score) {
+        best_score = score;
+        best_lag = lag;
+      }
+    }
+    if (energy > ENERGY_THRESHOLD) {
+      silent = false;
+    }
+    best_dist_diff[i] = -(float)best_lag * (1.0f/sample_freq) * 343.0f;
+    if (rank == 1) {
+      // printf("energy: %ld\n", energy);
+      // printf("pair (0, %d): best_lag=%d dist_diff=%f\n", i, best_lag, best_dist_diff[i]);
+    }
+  }
+
+  // Find intersection
+  float best_error = INFINITY;
+  float best_x = 0.0f;
+  float best_y = 0.0f;
+  for (float x = X_MIN; x < X_MAX; x += DX) {
+    for (float y = Y_MIN; y < Y_MAX; y += DY) {
+      float total_error = 0.0f;
+
+      float dx_0 = x - mic_positions[0][0];
+      float dy_0 = y - mic_positions[0][1];
+      float dist_0 = sqrtf(dx_0 * dx_0 + dy_0 * dy_0);
+
+      for (int i = 1; i < nproc; i++) {
+        float dx_i = x - mic_positions[i][0];
+        float dy_i = y - mic_positions[i][1];
+        float dist_i = sqrtf(dx_i * dx_i + dy_i * dy_i);
+
+        float error = dist_0 - dist_i - best_dist_diff[i];
+        total_error += error * error;
+      }
+
+      if (total_error < best_error) {
+        best_error = total_error;
+        best_x = x;
+        best_y = y;
+      }
+    }
+  }
+
+  if (rank == 1) {
+    if (silent) {
+      std::cout << "silent" << std::endl;
+    } else {
+      std::cout << "mic position: " << mic_positions[1][0] << ", " << mic_positions[1][1] << std::endl;
+      std::cout << "coord: " << best_x << ", " << best_y << std::endl;
+    }
+    // std::cout << "dx, dy: " << DX << ", " << DY << std::endl;
+  }
+}
+
+int main(int argc, char *argv[]) {
+  int pid;
+  int nproc;
+
+  MPI_Init(&argc, &argv);
+  MPI_Comm_rank(MPI_COMM_WORLD, &pid);
+  MPI_Comm_size(MPI_COMM_WORLD, &nproc);
+
+  std::string input_filename;
+  int sample_freq = 16000;
+  int num_samples = 4000;
+  int batch_size = 256;
+
+  int opt;
+  while ((opt = getopt(argc, argv, "f:s:n:b:")) != -1) {
+    switch (opt) {
+      case 'f':
+        input_filename = optarg;
+        break;
+      case 's':
+        sample_freq = atoi(optarg);
+        break;
+      case 'n':
+        num_samples = atoi(optarg);
+        break;
+      case 'b':
+        batch_size = atoi(optarg);
+        break;
+      default:
+        if (pid == 0) {
+          std::cerr << "Usage: " << argv[0] << "-f input_filename [-s sample_freq]\n";
+        }
+
+        MPI_Finalize();
+        exit(EXIT_FAILURE);
+    }
+  }
+
+  if (empty(input_filename) || sample_freq <= 0) {
+    if (pid == 0) {
+      std::cerr << "Usage: " << argv[0] << "-f input_filename [-s sample_freq]\n";
+    }
+
+    MPI_Finalize();
+    exit(EXIT_FAILURE);
+  }
+
+  std::vector<std::vector<int32_t>> raw_data;
+  raw_data = std::vector(num_samples, std::vector<int>(nproc));
+  std::ifstream fin(input_filename);
+
+  if (!fin) {
+    std::cerr << "Unable to open file: " << input_filename << ".\n";
+    exit(EXIT_FAILURE);
+  }
+
+  int num_mics = 0;
+  fin >> num_mics;
+  std::vector<std::vector<float>> mic_positions;
+  mic_positions = std::vector(num_mics, std::vector(2, 0.0f));
+  for (int i = 0; i < num_mics; i++) {
+    fin >> mic_positions[i][0] >> mic_positions[i][1];
+  }
+  for (auto &line: raw_data) {
+    for (auto &proc_data: line) {
+      fin >> proc_data;
+    }
+  }
+
+  for (int offset = 0; offset < num_samples; offset += batch_size) {
+    std::vector<int32_t> mic_data = std::vector(batch_size, 0);
+    for (int i = offset; i < offset + batch_size && i < num_samples; i++) {
+      mic_data[i - offset] = raw_data[i][pid];
+    }
+
+    // mic_data should have the expected data when running on STM32
+    sounddetect_ref_pair(mic_data, batch_size, sample_freq, mic_positions, nproc, pid);
+  }
+  MPI_Finalize();
+  return 0;
+}
