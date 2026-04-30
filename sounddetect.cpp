@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <climits>
 #include <cmath>
+#include <chrono>
 
 #define SOUND_OF_SPEED 343
 #define MAX_LAG 25
@@ -44,6 +45,7 @@ void sounddetect_ref_pair(
   int nproc,
   int rank
 ) {
+  const auto compute_start = std::chrono::steady_clock::now();
   std::vector<std::vector<int16_t>> all_mic_data(nproc, std::vector<int16_t>());
 
   // Simplifying from 24 bits to 16 bits
@@ -116,7 +118,7 @@ void sounddetect_ref_pair(
     }
     best_dist_diff[i] = -(float)best_lag * (1.0f/sample_freq) * 343.0f;
     if (rank == 1) {
-      printf("energy: %ld\n", energy);
+      // printf("energy: %ld\n", energy);
       // printf("pair (0, %d): best_lag=%d dist_diff=%f\n", i, best_lag, best_dist_diff[i]);
     }
   }
@@ -156,6 +158,8 @@ void sounddetect_ref_pair(
     } else {
       std::cout << "mic position: " << mic_positions[1][0] << ", " << mic_positions[1][1] << std::endl;
       std::cout << "coord: " << best_x << ", " << best_y << std::endl;
+      const double compute_time = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - compute_start).count();
+      std::cout << "time: " << std::fixed << std::setprecision(10) << compute_time << std::endl;
     }
     // std::cout << "dx, dy: " << DX << ", " << DY << std::endl;
   }
