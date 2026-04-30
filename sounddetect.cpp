@@ -174,6 +174,7 @@ void sounddetect_ref_pair(
 
   MPI_Send(&local_result, sizeof(Result), MPI_BYTE,
            next_rank, rank, MPI_COMM_WORLD);
+  all_results[rank] = local_result;
   int gather_done = 0;
   while(!gather_done) {
     Result recv_buffer;
