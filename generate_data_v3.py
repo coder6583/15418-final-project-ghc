@@ -165,7 +165,7 @@ def main():
         source_pos=source_pos,
         fs=32000,
         duration=0.125,
-        source_kind="speech_like",
+        source_kind="chirp_burst",
         noise_std=0.015,
         mic_gain_std=0.08,
         timing_jitter_samples=0.15,

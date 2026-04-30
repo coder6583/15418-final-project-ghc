@@ -10,7 +10,7 @@
 #include <cmath>
 
 #define SOUND_OF_SPEED 343
-#define MAX_LAG 30
+#define MAX_LAG 25
 
 #define X_MIN -1.0f
 #define X_MAX 1.0f
@@ -116,7 +116,7 @@ void sounddetect_ref_pair(
     }
     best_dist_diff[i] = -(float)best_lag * (1.0f/sample_freq) * 343.0f;
     if (rank == 1) {
-      // printf("energy: %ld\n", energy);
+      printf("energy: %ld\n", energy);
       // printf("pair (0, %d): best_lag=%d dist_diff=%f\n", i, best_lag, best_dist_diff[i]);
     }
   }
@@ -131,14 +131,14 @@ void sounddetect_ref_pair(
 
       float dx_0 = x - mic_positions[0][0];
       float dy_0 = y - mic_positions[0][1];
-      float dist_0 = sqrtf(dx_0 * dx_0 + dy_0 * dy_0);
+      float dist_0_sq = dx_0 * dx_0 + dy_0 * dy_0;
 
       for (int i = 1; i < nproc; i++) {
         float dx_i = x - mic_positions[i][0];
         float dy_i = y - mic_positions[i][1];
-        float dist_i = sqrtf(dx_i * dx_i + dy_i * dy_i);
+        float dist_i_sq = dx_i * dx_i + dy_i * dy_i;
 
-        float error = dist_0 - dist_i - best_dist_diff[i];
+        float error = dist_0_sq - dist_i_sq - best_dist_diff[i];
         total_error += error * error;
       }
 
