@@ -25,6 +25,13 @@
 
 #define ENERGY_THRESHOLD 20000000000
 
+struct Result {
+  float error;
+  float x;
+  float y;
+  uint8_t src;
+};
+
 int get_next_rank(int rank, int nproc) {
   return (rank + 1) % nproc;
 }
@@ -77,10 +84,8 @@ void sounddetect_ref_pair(
     if (orig_src == rank) {
       done = 1;
     } else {
-      if (rank != 0) {
-        memcpy(all_mic_data[orig_src].data(), recv_buffer.data(),
-               send_size * sizeof(int16_t));
-      }
+      memcpy(all_mic_data[orig_src].data(), recv_buffer.data(),
+             send_size * sizeof(int16_t));
       MPI_Send(recv_buffer.data(), send_size * sizeof(int16_t),
                MPI_BYTE, next_rank, rank, MPI_COMM_WORLD);
       done = 0;
@@ -123,11 +128,16 @@ void sounddetect_ref_pair(
     }
   }
 
+  int nx = GRID_WIDTH / nproc;
+  int start_ix = rank * nx;
+  int end_ix = (rank + 1) * nx;
+
   // Find intersection
   float best_error = INFINITY;
   float best_x = 0.0f;
   float best_y = 0.0f;
-  for (float x = X_MIN; x < X_MAX; x += DX) {
+  for (int ix = start_ix; ix < end_ix; ix ++) {
+    float x = X_MIN + ix * DX;
     for (float y = Y_MIN; y < Y_MAX; y += DY) {
       float total_error = 0.0f;
 
@@ -152,12 +162,53 @@ void sounddetect_ref_pair(
     }
   }
 
+  Result local_result = {
+    best_error,
+    best_x,
+    best_y,
+    rank,
+  };
+
+  std::vector<Result> all_results;
+  all_results.resize(nproc);
+
+  MPI_Send(&local_result, sizeof(Result), MPI_BYTE,
+           next_rank, rank, MPI_COMM_WORLD);
+  int gather_done = 0;
+  while(!gather_done) {
+    Result recv_buffer;
+    MPI_Recv(&recv_buffer, sizeof(Result), MPI_BYTE,
+             prev_rank, MPI_ANY_TAG, MPI_COMM_WORLD, NULL);
+
+    int orig_src = recv_buffer.src;
+    if (orig_src == rank) {
+      gather_done = 1;
+    } else {
+      memcpy(&all_results[orig_src], &recv_buffer, sizeof(Result));
+      MPI_Send(&recv_buffer, sizeof(Result), MPI_BYTE,
+               next_rank, rank, MPI_COMM_WORLD);
+      gather_done = 0;
+    }
+  }
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  float global_best_error = INFINITY;
+  float global_x = 0.0f;
+  float global_y = 0.0f;
+  for (int i = 0; i < nproc; i++) {
+    if (all_results[i].error < global_best_error) {
+      global_best_error = all_results[i].error;
+      global_x = all_results[i].x;
+      global_y = all_results[i].y;
+    }
+  }
+
   if (rank == 1) {
     if (silent) {
       std::cout << "silent" << std::endl;
     } else {
       std::cout << "mic position: " << mic_positions[1][0] << ", " << mic_positions[1][1] << std::endl;
-      std::cout << "coord: " << best_x << ", " << best_y << std::endl;
+      std::cout << "coord: " << global_x << ", " << global_y << std::endl;
       const double compute_time = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - compute_start).count();
       std::cout << "time: " << std::fixed << std::setprecision(10) << compute_time << std::endl;
     }
