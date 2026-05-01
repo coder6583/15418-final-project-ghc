@@ -118,6 +118,7 @@ void sounddetect_ref_pair(
     silent,
     rank
   };
+  best_dist_diffs[rank] = timelag_result;
 
   int next_rank = get_next_rank(rank, nproc);
   int prev_rank = get_prev_rank(rank, nproc);
