@@ -17,13 +17,20 @@
 #define X_MAX 1.0f
 #define Y_MIN -1.0f
 #define Y_MAX 1.0f
-#define GRID_WIDTH 200
-#define GRID_HEIGHT 200
+#define GRID_WIDTH 10000
+#define GRID_HEIGHT 10000
 
 #define DX (X_MAX - X_MIN) / (GRID_WIDTH - 1)
 #define DY (Y_MAX - Y_MIN) / (GRID_HEIGHT - 1)
 
 #define ENERGY_THRESHOLD 20000000000
+
+
+struct TimeLag {
+  float dist_diff;
+  uint8_t silent;
+  uint8_t src;
+};
 
 struct Result {
   float error;
@@ -53,80 +60,89 @@ void sounddetect_ref_pair(
   int rank
 ) {
   const auto compute_start = std::chrono::steady_clock::now();
-  std::vector<std::vector<int16_t>> all_mic_data(nproc, std::vector<int16_t>());
+  std::vector<int16_t> audio_data;
 
   // Simplifying from 24 bits to 16 bits
-  all_mic_data[rank].push_back((int16_t)rank);
   for (auto &data: mic_data) {
-    all_mic_data[rank].push_back((int16_t)(data >> 8));
+    audio_data.push_back((int16_t)(data >> 8));
   }
 
-  int send_size = num_samples + 1;
-  for (int i = 0; i < nproc; i++) {
-    if (i != rank) {
-      all_mic_data[i] = std::vector<int16_t>(send_size, 0);
+  std::vector<int16_t> ref_data;
+  ref_data.resize(num_samples);
+
+  if (rank == 0) {
+    for (int i = 0; i < num_samples; i++) {
+      ref_data[i] = audio_data[i];
     }
   }
+
+  MPI_Bcast(ref_data.data(), num_samples * sizeof(int16_t), MPI_BYTE, 0, MPI_COMM_WORLD);
+
+  // Find Time Lag
+  float best_dist_diff = 0.0f;
+  uint8_t silent = 1;
+
+  int64_t energy = 0;
+  int best_lag = 0;
+  int64_t best_score = INT64_MIN;
+  for (int lag = -MAX_LAG; lag < MAX_LAG; lag++) {
+    int64_t score = 0;
+    for (int j = 0; j < num_samples; j++) {
+      energy += (int64_t)ref_data[j] * (int64_t)ref_data[j];
+      if (j + lag < 0) {
+        continue;
+      }
+      if (j + lag >= num_samples) {
+        continue;
+      }
+      score += (int64_t)audio_data[j + lag] * (int64_t)ref_data[j];
+    }
+    if (score > best_score) {
+      best_score = score;
+      best_lag = lag;
+    }
+  }
+  if (energy > ENERGY_THRESHOLD) {
+    silent = 0;
+  }
+  best_dist_diff = -(float)best_lag * (1.0f/sample_freq) * 343.0f;
+  if (rank == 1) {
+    // printf("energy: %ld\n", energy);
+    // printf("pair (0, %d): best_lag=%d dist_diff=%f\n", i, best_lag, best_dist_diff[i]);
+  }
+
+  std::vector<struct TimeLag> best_dist_diffs(nproc);
+
+  struct TimeLag timelag_result = {
+    best_dist_diff,
+    silent,
+    rank
+  };
 
   int next_rank = get_next_rank(rank, nproc);
   int prev_rank = get_prev_rank(rank, nproc);
   // Send data to all nodes
   // initiate sending data
-  MPI_Send(all_mic_data[rank].data(), send_size * sizeof(int16_t),
+  MPI_Send(&timelag_result, sizeof(struct TimeLag),
            MPI_BYTE, next_rank, rank, MPI_COMM_WORLD);
   int done = 0;
   while (!done) {
-    std::vector<int16_t> recv_buffer(send_size, 0);
-    MPI_Recv(recv_buffer.data(), send_size * sizeof(int16_t),
+    struct TimeLag recv_buffer;
+    MPI_Recv(&recv_buffer, sizeof(struct TimeLag),
              MPI_BYTE, prev_rank, MPI_ANY_TAG, MPI_COMM_WORLD, NULL);
 
-    int orig_src = recv_buffer[0];
+    int orig_src = recv_buffer.src;
     if (orig_src == rank) {
       done = 1;
     } else {
-      memcpy(all_mic_data[orig_src].data(), recv_buffer.data(),
-             send_size * sizeof(int16_t));
-      MPI_Send(recv_buffer.data(), send_size * sizeof(int16_t),
+      memcpy(&best_dist_diffs[orig_src], &recv_buffer,
+             sizeof(struct TimeLag));
+      MPI_Send(&recv_buffer, sizeof(struct TimeLag),
                MPI_BYTE, next_rank, rank, MPI_COMM_WORLD);
       done = 0;
     }
   }
   MPI_Barrier(MPI_COMM_WORLD);
-
-  // Find Time Lag
-  std::vector<float> best_dist_diff(nproc, 0.0f);
-  bool silent = true;
-
-  for (int i = 1; i < nproc; i++) {
-    int64_t energy = 0;
-    int best_lag = 0;
-    int64_t best_score = INT64_MIN;
-    for (int lag = -MAX_LAG; lag < MAX_LAG; lag++) {
-      int64_t score = 0;
-      for (int j = 1; j < send_size; j++) {
-        energy += (int64_t)all_mic_data[0][j] * (int64_t)all_mic_data[0][j];
-        if (j + lag < 0) {
-          continue;
-        }
-        if (j + lag >= send_size) {
-          continue;
-        }
-        score += (int64_t)all_mic_data[i][j + lag] * (int64_t)all_mic_data[0][j];
-      }
-      if (score > best_score) {
-        best_score = score;
-        best_lag = lag;
-      }
-    }
-    if (energy > ENERGY_THRESHOLD) {
-      silent = false;
-    }
-    best_dist_diff[i] = -(float)best_lag * (1.0f/sample_freq) * 343.0f;
-    if (rank == 1) {
-      // printf("energy: %ld\n", energy);
-      // printf("pair (0, %d): best_lag=%d dist_diff=%f\n", i, best_lag, best_dist_diff[i]);
-    }
-  }
 
   int nx = GRID_WIDTH / nproc;
   int start_ix = rank * nx;
@@ -150,7 +166,7 @@ void sounddetect_ref_pair(
         float dy_i = y - mic_positions[i][1];
         float dist_i_sq = dx_i * dx_i + dy_i * dy_i;
 
-        float error = dist_0_sq - dist_i_sq - best_dist_diff[i];
+        float error = dist_0_sq - dist_i_sq - best_dist_diffs[i].dist_diff;
         total_error += error * error;
       }
 
